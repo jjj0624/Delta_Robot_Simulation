@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib
 
-matplotlib.use('TkAgg')  # 强制后端兼容
+matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.animation import FuncAnimation
@@ -11,21 +11,24 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 
-# ================= 解决 Matplotlib 中文显示乱码问题 =================
+# 设置中文字体，防止Matplotlib绘图时中文显示为方块
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
 plt.rcParams['axes.unicode_minus'] = False
 
 import os
 from dotenv import load_dotenv
 
-# 加载 .env 文件中的环境变量
 load_dotenv()
 
-# ================= 1. Real LLM Agent Integration =================
+
 class AgentParser:
+    """
+    大模型智能体解析器类：
+    负责将用户的自然语言指令（如“画一只猪”）转化为机器人可执行的离散空间坐标点序列 (JSON)。
+    """
+
     def __init__(self):
         from openai import OpenAI
-        # 安全读取 API Key
         self.api_key = os.getenv("DEEPSEEK_API_KEY")
 
         if not self.api_key:
@@ -33,6 +36,7 @@ class AgentParser:
 
         self.client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
 
+        # System Prompt 设定了严格的 Z 轴高度规范（抬笔/落笔机制）以及拆解复杂图形的几何法则
         self.system_prompt = """
         你是一个 Delta 机器人的高级控制大脑与矢量图形引擎。请将用户的指令解析为严格的 JSON。
 
@@ -104,6 +108,7 @@ class AgentParser:
             print(json.loads(response.choices[0].message.content))
             return json.loads(response.choices[0].message.content)
         except Exception as e:
+            # API调用失败时的降级方案，保证程序的鲁棒性
             print(f"API 请求失败，启用本地降级匹配: {str(e)}")
             return self.local_fallback_parse(text)
 
@@ -117,94 +122,128 @@ class AgentParser:
         return {"error": "无法理解指令"}
 
 
-# ================= 2. Delta Robot Kinematics =================
 class DeltaRobot:
+    """
+    Delta并联机器人运动学核心类：
+    定义了机器人的物理尺寸，并提供逆运动学求解算法。
+    """
+
     def __init__(self, r_base=150, r_end=50, l_bicep=200, l_forearm=450, w_rod=40):
+        # 几何参数初始化：静平台半径R、动平台半径r、主动臂长L1、从动臂长L2、平行四边形杆间距W
         self.R, self.r, self.L1, self.L2, self.W = r_base, r_end, l_bicep, l_forearm, w_rod
+        # 三个主动臂在静平台上的安装角度（相差120度）
         self.angles = np.radians([0, 120, 240])
 
     def inverse_kinematics(self, x, y, z):
+        """
+        逆运动学解算：输入末端执行器目标空间坐标(x, y, z)，输出三个主动臂的目标旋转角度[theta1, theta2, theta3]。
+        原理：将问题转化为求三个球面的交点，利用三角函数代换解出一元二次方程。
+        """
         thetas = []
         for i in range(3):
             alpha = self.angles[i]
+            # 将末端坐标转换到对应主动臂所在的局部坐标系下
             x_local = x * np.cos(alpha) + y * np.sin(alpha)
             y_local = -x * np.sin(alpha) + y * np.cos(alpha)
+            # 计算等效末端点位置
             p_x, p_y, p_z = x_local + self.r - self.R, y_local, z
+
+            # 构建关于tan(theta/2)的二次方程系数 (根据L1, L2和局部坐标推导)
             E1, F1 = 2 * self.L1 * p_x, -2 * self.L1 * p_z
             G1 = p_x ** 2 + p_y ** 2 + p_z ** 2 + self.L1 ** 2 - self.L2 ** 2
+
+            # 计算判别式 D
             D = F1 ** 2 - G1 ** 2 + E1 ** 2
 
+            # 判断是否有实数解（目标点是否在工作空间内）
             if D < 0:
                 if D > -1e-6:
-                    D = 0.0
+                    D = 0.0  # 容忍浮点数精度误差
                 else:
-                    return None
+                    return None  # 无法到达该位置
 
             denom = G1 + E1
             if abs(denom) < 1e-8:
-                return None
+                return None  # 奇异位形保护
 
+            # 求解方程得到 theta
             t = (F1 - np.sqrt(D)) / denom
             thetas.append(2 * np.arctan(t))
         return thetas
 
 
-# ================= 3. Cartesian PID Controller =================
 class PhysicalPID:
+    """
+    物理PID控制器：
+    用于模拟真实的机器人动态响应。目标坐标变化时，机器人不会瞬间瞬移，
+    而是通过计算误差、累积误差和误差变化率（PID），生成加速度和速度，实现平滑移动。
+    """
+
     def __init__(self):
-        self.pos = np.array([0.0, 0.0, -300.0])
-        self.vel = np.array([0.0, 0.0, 0.0])
-        self.integral = np.zeros(3)
-        self.prev_error = np.zeros(3)
+        self.pos = np.array([0.0, 0.0, -300.0])  # 当前物理位置
+        self.vel = np.array([0.0, 0.0, 0.0])  # 当前速度
+        self.integral = np.zeros(3)  # 积分项（累积误差）
+        self.prev_error = np.zeros(3)  # 上一帧误差（用于求微分）
+        # PID控制参数：可根据实际仿真手感在界面中动态调节
         self.kp, self.ki, self.kd = 0.15, 0.001, 0.4
 
     def update(self, target_pos, dt=1.0):
         target = np.array(target_pos)
         error = target - self.pos
+
         self.integral += error * dt
         derivative = (error - self.prev_error) / dt
         self.prev_error = error
+
+        # 计算加速度 a = P + I + D
         acceleration = self.kp * error + self.ki * self.integral + self.kd * derivative
+
+        # 速度更新与阻尼衰减（模拟摩擦力，防止过冲震荡）
         self.vel += acceleration * dt
         self.vel *= 0.95
+
+        # 位置更新
         self.pos += self.vel * dt
         return self.pos, np.linalg.norm(self.vel), np.linalg.norm(acceleration)
 
 
-# ================= System Variables =================
+# 实例化核心组件
 robot = DeltaRobot()
 agent = AgentParser()
 pid_sys = PhysicalPID()
 
+# 全局状态变量初始化
 current_frame, total_frames = 0, 100
 traj_x, traj_y, traj_z = np.full(100, 0.0), np.full(100, 0.0), np.full(100, -300.0)
-traj_g = np.full(100, False)
-traj_p = np.full(100, 1)
+traj_g = np.full(100, False)  # 夹爪状态序列
+traj_p = np.full(100, 1)  # 画笔状态序列 (1为落笔, 0为抬笔)
 
 target_th_profile, target_dth_profile, target_ddth_profile = [], [], []
-
 actual_pos_h = {"x": [], "y": [], "z": []}
 draw_h = {"x": [], "y": [], "z": []}
-
 actual_th_h, actual_dth_h, actual_ddth_h = [], [], []
 target_th_h = []
 
-use_s_curve = True
-show_obstacle = True
+use_s_curve = True  # 启用 S型速度曲线插补
+show_obstacle = True  # 避障球体显示状态
 show_env_mode4 = False
-is_processing = False
-is_paused = False
+is_processing = False  # NLP指令处理锁
+is_paused = False  # 仿真暂停标志
 clear_history_frame = -1
 stop_draw_frame = -1
 steady_counter = 0
 current_mode = 0
 
+# 避障球体参数
 obs_center = np.array([80, 80, -300])
 obs_r = 50
 
 
-# ================= 4. Trajectory & Application Logic =================
 def interpolate_velocity(start, end, steps):
+    """
+    路径插补函数：生成起点到终点的点序列。
+    如果 use_s_curve 为真，则使用三次多项式平滑插值(S型加减速)，使得运动起步和停止更加柔和。
+    """
     steps = max(2, int(steps))
     t = np.linspace(0, 1, steps)
     s = (3 * t ** 2 - 2 * t ** 3) if use_s_curve else t
@@ -212,17 +251,22 @@ def interpolate_velocity(start, end, steps):
 
 
 def calc_joint_profiles(x_arr, y_arr, z_arr):
+    """
+    逆解剖析：通过末端空间轨迹序列，反求出各个关节的角度、角速度和角加速度曲线。
+    用于在侧边图表中展示控制系统性能。
+    """
     th_arr = []
     for x, y, z in zip(x_arr, y_arr, z_arr):
         ths = robot.inverse_kinematics(x, y, z)
         if ths is not None:
-            th_arr.append(np.degrees(ths[0]))
+            th_arr.append(np.degrees(ths[0]))  # 只记录并展示关节1作为代表
         else:
             th_arr.append(th_arr[-1] if th_arr else 0)
     th_arr = np.array(th_arr)
+
     if len(th_arr) > 1:
-        dth_arr = np.pad(np.diff(th_arr), (0, 1), 'edge')
-        ddth_arr = np.pad(np.diff(dth_arr), (0, 1), 'edge')
+        dth_arr = np.pad(np.diff(th_arr), (0, 1), 'edge')  # 一阶差分求速度
+        ddth_arr = np.pad(np.diff(dth_arr), (0, 1), 'edge')  # 二阶差分求加速度
     else:
         dth_arr = np.zeros_like(th_arr)
         ddth_arr = np.zeros_like(th_arr)
@@ -230,50 +274,57 @@ def calc_joint_profiles(x_arr, y_arr, z_arr):
 
 
 def plan_trajectory(start_pt, end_pt):
-    v_max = 4.0
+    """
+    轨迹规划器（带避障算法）：
+    利用射线与球体相交的数学模型检测直线路径是否穿过障碍物。如果碰撞，则动态生成一个途经点（via point）绕开障碍物。
+    """
+    v_max = 7.0
     start_arr = np.array(start_pt)
     end_arr = np.array(end_pt)
     dist = np.linalg.norm(end_arr - start_arr)
-    frames = max(40, int(dist / v_max))
 
+    # 根据距离和最大速度计算需要多少动画帧
+    frames = max(12, int(dist / v_max))
+
+    # 避障逻辑：检测线段与球体的相交
     if show_obstacle and not show_env_mode4 and dist > 1e-3:
-        # 【核心修改1：水平圆柱面包络排斥】
-        # 将安全半径扩大到160mm（障碍物50 + 动平台50 + 连杆安全余量60）
-        # 强制将轨迹在 XY 平面上推出极大的迂回弧度，彻底规避从动臂穿模
-        safe_r = obs_r + robot.r + 60
-
+        safe_r = obs_r + robot.r + 60  # 扩展安全半径，考虑末端平台本身的物理体积
         d = end_arr[:2] - start_arr[:2]
         f = start_arr[:2] - obs_center[:2]
+
+        # 求解一元二次方程 at^2 + bt + c = 0 寻找交点
         a = np.dot(d, d)
         b = 2 * np.dot(f, d)
         c = np.dot(f, f) - safe_r ** 2
 
         if a > 1e-6:
             discriminant = b ** 2 - 4 * a * c
+            # 若判别式>=0，说明存在交点风险
             if discriminant >= 0:
                 t1 = (-b - np.sqrt(discriminant)) / (2 * a)
                 t2 = (-b + np.sqrt(discriminant)) / (2 * a)
+
+                # 判断交点是否在线段范围内 (0 <= t <= 1)
                 if (0 <= t1 <= 1) or (0 <= t2 <= 1) or (t1 < 0 and t2 > 1):
-                    # 发生投影碰撞，计算 XY 平面上的法向推力
+                    # 寻找线段上离球心最近的点
                     t_closest = np.clip(-b / (2 * a), 0, 1)
                     closest_pt_xy = start_arr[:2] + t_closest * d
                     push_vec = closest_pt_xy - obs_center[:2]
                     push_dist = np.linalg.norm(push_vec)
 
                     if push_dist < 1e-3:
-                        push_vec = np.array([-d[1], d[0]])  # 如果穿过正中心，则朝垂直方向推
+                        push_vec = np.array([-d[1], d[0]])
                         push_dist = np.linalg.norm(push_vec)
 
-                    # 生成过渡点
+                    # 根据法向量向外推计算出一个安全途经点 (via point)
                     via_xy = obs_center[:2] + (push_vec / push_dist) * safe_r
-
-                    # 【核心修改2：克制抬升】
-                    # Z轴只做30mm的温和抬升，绝对限制在 -280 以下，防止冲出顶部奇异区导致系统崩溃
                     via_z = max(start_arr[2], end_arr[2]) + 30
                     via_z = np.clip(via_z, -550, -280)
                     via_pt = np.array([via_xy[0], via_xy[1], via_z])
 
-                    frames_half = frames // 2
+                    frames_half = max(2, frames // 2)
+
+                    # 将一条直线拆分为两段，绕过障碍物
                     tx1 = interpolate_velocity(start_pt[0], via_pt[0], frames_half)
                     ty1 = interpolate_velocity(start_pt[1], via_pt[1], frames_half)
                     tz1 = interpolate_velocity(start_pt[2], via_pt[2], frames_half)
@@ -284,6 +335,7 @@ def plan_trajectory(start_pt, end_pt):
 
                     return np.concatenate([tx1, tx2]), np.concatenate([ty1, ty2]), np.concatenate([tz1, tz2])
 
+    # 无碰撞风险时，直接直线插补
     tx = interpolate_velocity(start_pt[0], end_pt[0], frames)
     ty = interpolate_velocity(start_pt[1], end_pt[1], frames)
     tz = interpolate_velocity(start_pt[2], end_pt[2], frames)
@@ -291,6 +343,10 @@ def plan_trajectory(start_pt, end_pt):
 
 
 def execute_path(waypoints, action_desc="移动", hide_approach=False, gripper_states=None, is_mode4=False):
+    """
+    路径执行器：将输入的关键点序列(waypoints)展开填充为连续的动画帧轨迹数组。
+    并且处理不同模式下的环境显隐、落笔抬笔状态同步。
+    """
     global traj_x, traj_y, traj_z, traj_g, traj_p, total_frames, current_frame, is_processing, is_paused
     global target_th_profile, target_dth_profile, target_ddth_profile
     global clear_history_frame, stop_draw_frame, steady_counter
@@ -308,17 +364,20 @@ def execute_path(waypoints, action_desc="移动", hide_approach=False, gripper_s
     clear_idx = -1
     stop_draw_idx = -1
 
+    # 遍历每两个相邻航点，进行插补
     for i in range(len(waypoints) - 1):
         pt1 = waypoints[i]
         pt2 = waypoints[i + 1]
 
         tx, ty, tz = plan_trajectory(pt1[:3], pt2[:3])
-        pen_down = pt2[3] if len(pt2) > 3 else 1
+        pen_down = pt2[3] if len(pt2) > 3 else 1  # 默认落笔状态
 
+        # 隐藏接近轨迹 (比如画笔移动到起笔点之前的过程)
         if hide_approach and i == 0 and len(waypoints) > 2:
             clear_idx = len(all_tx) + len(tx) - 1
             pen_down = 0
 
+        # 如果指令包含回原点操作，标记停止绘画，防止拉线
         if current_mode == 3 and i > 0 and np.linalg.norm(np.array(pt2[:3]) - np.array([0, 0, -300])) < 1.0:
             if stop_draw_idx == -1:
                 stop_draw_idx = len(all_tx)
@@ -338,12 +397,14 @@ def execute_path(waypoints, action_desc="移动", hide_approach=False, gripper_s
     traj_p = np.array(all_p)
     total_frames = len(traj_x)
 
+    # 预先计算并缓存理论的关节曲线图表数据
     target_th_profile, target_dth_profile, target_ddth_profile = calc_joint_profiles(traj_x, traj_y, traj_z)
 
     clear_history_frame = clear_idx
     stop_draw_frame = stop_draw_idx
     steady_counter = 0
 
+    # 清空历史数据列表，准备新一轮记录
     actual_pos_h["x"].clear()
     actual_pos_h["y"].clear()
     actual_pos_h["z"].clear()
@@ -361,13 +422,17 @@ def execute_path(waypoints, action_desc="移动", hide_approach=False, gripper_s
 
 
 def draw_shape(shape_type):
+    """
+    预设图形绘制功能：生成圆形、三角形、五角星的参数化航点。
+    """
     global current_mode
     current_mode = 2
     curr = [traj_x[-1], traj_y[-1], traj_z[-1]]
     z_plane = -400
     radius = 80
+
     if shape_type == 'circle':
-        theta = np.linspace(0, 2 * np.pi, 20)
+        theta = np.linspace(0, 2 * np.pi, 40)
         shape_pts = [[radius * np.cos(t), radius * np.sin(t), z_plane, 1] for t in theta]
         name = "圆形"
     elif shape_type == 'triangle':
@@ -381,11 +446,16 @@ def draw_shape(shape_type):
     else:
         return
 
+    # 航点构建：当前点(p=0) -> 形状起点(p=0) -> 形状路径(p=1)
     waypoints = [[curr[0], curr[1], curr[2], 0], [shape_pts[0][0], shape_pts[0][1], shape_pts[0][2], 0]] + shape_pts
     execute_path(waypoints, f"绘制 {name}", hide_approach=True)
 
 
 def demo_conveyor():
+    """
+    工业分拣场景演示（门型运动轨迹规划）：
+    规划一段经典的 "抓取-提升-平移-下降-释放" 的物料搬运轨迹。
+    """
     global show_env_mode4, current_mode
     current_mode = 4
     show_env_mode4 = True
@@ -394,6 +464,7 @@ def demo_conveyor():
     pick_x, pick_y = 150, 100
     drop_x, drop_y = -150, -100
 
+    # 绘制传送带和料箱环境
     bx = [pick_x - belt_w / 2, pick_x + belt_w / 2, pick_x + belt_w / 2, pick_x - belt_w / 2, pick_x - belt_w / 2]
     by = [pick_y - belt_w / 2, pick_y - belt_w / 2, pick_y + belt_w / 2, pick_y + belt_w / 2, pick_y - belt_w / 2]
     belt_line.set_data(bx, by)
@@ -410,18 +481,20 @@ def demo_conveyor():
     workpiece.set_3d_properties([-480])
     workpiece.set_visible(True)
 
+    # 规划门型轨迹航点
     curr = [traj_x[-1], traj_y[-1], traj_z[-1]]
     belt_hover, belt_pick = [pick_x, pick_y, -300], [pick_x, pick_y, -480]
     box_hover, box_drop = [drop_x, drop_y, -300], [drop_x, drop_y, -450]
 
     waypoints = [curr, belt_hover, belt_pick, belt_hover, box_hover, box_drop, box_hover, [0, 0, -300]]
-    gripper_states = [False, False, True, True, True, False, False]
+    gripper_states = [False, False, True, True, True, False, False]  # 夹爪同步信号
 
     execute_path(waypoints, f"抓取 ({pick_x},{pick_y}) -> ({drop_x},{drop_y})",
                  gripper_states=gripper_states, is_mode4=True)
 
 
 def execute_action(action_dict):
+    """根据解析到的 JSON 字典执行相应的机器人宏动作"""
     curr_pos = [traj_x[-1], traj_y[-1], traj_z[-1]]
     action = action_dict.get('action', 'home')
 
@@ -432,6 +505,7 @@ def execute_action(action_dict):
     elif action == 'path':
         waypoints = action_dict.get('waypoints', [])
         if waypoints:
+            # 在自定义路径前插入一个当前点以保证轨迹连贯性
             waypoints.insert(0, [curr_pos[0], curr_pos[1], curr_pos[2], 0])
             execute_path(waypoints, "执行自定义轨迹", hide_approach=True)
     else:
@@ -439,6 +513,10 @@ def execute_action(action_dict):
 
 
 def async_execute_command(text):
+    """
+    异步调用大模型接口执行命令。
+    网络请求会耗时，放入新线程中防止阻塞 Tkinter UI 和 Matplotlib 动画更新。
+    """
     global is_processing
     update_status(f"状态: 解析指令 '{text}' 中...", "orange")
     curr_pos = [traj_x[-1], traj_y[-1], traj_z[-1]]
@@ -452,12 +530,13 @@ def async_execute_command(text):
         is_processing = False
 
 
-# ================= UI Setup =================
 def update_status(text, color):
+    # 更新 3D 画布右上角的状态显示文本
     status_text_3d.set_text(text)
     status_text_3d.set_color(color)
 
 
+# ================== GUI 与 交互层 ==================
 root = tk.Tk()
 root.title("Delta 机器人仿真平台")
 root.geometry("1400x850")
@@ -490,6 +569,7 @@ tk.Button(basic_control_frame, text="⏸ 暂停", command=toggle_stop, width=8, 
 tk.Button(basic_control_frame, text="↺ 复位", command=trigger_reset, width=8, bg="#F44336", fg="white").pack(
     side=tk.LEFT, padx=3)
 
+# 模式选择面板 (Tabs)
 mode_frame = tk.LabelFrame(top_frame, text="模式选择", font=('Arial', 10, 'bold'), padx=10, pady=5)
 mode_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=15)
 notebook = ttk.Notebook(mode_frame)
@@ -498,16 +578,16 @@ notebook.pack(fill=tk.BOTH, expand=True)
 tab_mode1 = ttk.Frame(notebook)
 notebook.add(tab_mode1, text="模式1: 点对点运动")
 tk.Label(tab_mode1, text="X:").pack(side=tk.LEFT, padx=2)
-entry_x = tk.Entry(tab_mode1, width=6);
-entry_x.insert(0, "100");
+entry_x = tk.Entry(tab_mode1, width=6)
+entry_x.insert(0, "100")
 entry_x.pack(side=tk.LEFT)
 tk.Label(tab_mode1, text="Y:").pack(side=tk.LEFT, padx=2)
-entry_y = tk.Entry(tab_mode1, width=6);
-entry_y.insert(0, "50");
+entry_y = tk.Entry(tab_mode1, width=6)
+entry_y.insert(0, "50")
 entry_y.pack(side=tk.LEFT)
 tk.Label(tab_mode1, text="Z:").pack(side=tk.LEFT, padx=2)
-entry_z = tk.Entry(tab_mode1, width=6);
-entry_z.insert(0, "-400");
+entry_z = tk.Entry(tab_mode1, width=6)
+entry_z.insert(0, "-400")
 entry_z.pack(side=tk.LEFT)
 
 
@@ -556,15 +636,16 @@ tk.Label(tab_mode4, text="动态生成随机料盒位置并规划抓取路径").
 tk.Button(tab_mode4, text="启动抓取", command=demo_conveyor, bg="#00BCD4", fg="white", width=18).pack(side=tk.LEFT,
                                                                                                       padx=10)
 
-# --- 底部面板 ---
 bottom_frame = tk.Frame(root, padx=10, pady=5)
 bottom_frame.pack(side=tk.BOTTOM, fill=tk.X)
 
+# 扩展功能 1: PID 控制调节面板
 ext1_frame = tk.LabelFrame(bottom_frame, text="扩展功能1: PID 实时调节", font=('Arial', 9, 'bold'))
 ext1_frame.pack(side=tk.LEFT, padx=10, fill=tk.Y, expand=True)
 
 
 def update_pid(*args):
+    # 将UI面板上的滑动条数值同步至后端的物理控制器实例
     pid_sys.kp = scale_kp.get()
     pid_sys.ki = scale_ki.get()
     pid_sys.kd = scale_kd.get()
@@ -572,22 +653,24 @@ def update_pid(*args):
 
 scale_kp = tk.Scale(ext1_frame, from_=0.0, to=0.5, resolution=0.01, orient=tk.HORIZONTAL, label="Kp",
                     command=update_pid, length=120)
-scale_kp.set(pid_sys.kp);
+scale_kp.set(pid_sys.kp)
 scale_kp.pack(side=tk.LEFT, padx=5)
 scale_ki = tk.Scale(ext1_frame, from_=0.0, to=0.05, resolution=0.001, orient=tk.HORIZONTAL, label="Ki",
                     command=update_pid, length=120)
-scale_ki.set(pid_sys.ki);
+scale_ki.set(pid_sys.ki)
 scale_ki.pack(side=tk.LEFT, padx=5)
 scale_kd = tk.Scale(ext1_frame, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, label="Kd",
                     command=update_pid, length=120)
-scale_kd.set(pid_sys.kd);
+scale_kd.set(pid_sys.kd)
 scale_kd.pack(side=tk.LEFT, padx=5)
 
+# 扩展功能 2: 工作空间可视化计算
 ext2_frame = tk.LabelFrame(bottom_frame, text="扩展功能2: 工作空间可视化", font=('Arial', 9, 'bold'))
 ext2_frame.pack(side=tk.LEFT, padx=10, fill=tk.Y, expand=True)
 
 
 def finish_ws_calculation(ws_x, ws_y, ws_z, ws_c):
+    """工作空间点云图渲染回调（在主线程执行更新UI）"""
     try:
         global workspace_scatter
         if ws_x:
@@ -596,6 +679,7 @@ def finish_ws_calculation(ws_x, ws_y, ws_z, ws_c):
                     workspace_scatter.remove()
                 except:
                     pass
+            # 绘制点云散点图
             workspace_scatter = ax_3d.scatter(ws_x, ws_y, ws_z, c=ws_c, cmap='viridis', alpha=0.4)
             workspace_scatter.set_visible(True)
             fig.canvas.draw_idle()
@@ -606,6 +690,11 @@ def finish_ws_calculation(ws_x, ws_y, ws_z, ws_c):
 
 
 def toggle_workspace():
+    """
+    工作空间计算器：
+    利用多线程暴力遍历笛卡尔空间中的点，带入逆运动学方程，有解即意味着点位于工作空间内。
+    用点的颜色深浅反映各个关节角度之和，一定程度上表征雅可比矩阵的条件数或奇异性倾向。
+    """
     global workspace_scatter
     if 'workspace_scatter' in globals() and workspace_scatter is not None and workspace_scatter.get_visible():
         workspace_scatter.set_visible(False)
@@ -621,13 +710,14 @@ def toggle_workspace():
         for z in range(-550, -200, 25):
             for x in range(-250, 250, 25):
                 for y in range(-250, 250, 25):
-                    if x ** 2 + y ** 2 > 250 ** 2: continue
+                    if x ** 2 + y ** 2 > 250 ** 2: continue  # 剪裁成圆柱形包围盒以加速
                     thetas = robot.inverse_kinematics(x, y, z)
                     if thetas:
-                        ws_x.append(x);
-                        ws_y.append(y);
+                        ws_x.append(x)
+                        ws_y.append(y)
                         ws_z.append(z)
-                        ws_c.append(np.sum(np.array(thetas) ** 2))
+                        ws_c.append(np.sum(np.array(thetas) ** 2))  # 用于后续映射颜色
+        # 计算完成后利用 after 跨线程触发UI更新
         root.after(0, lambda: finish_ws_calculation(ws_x, ws_y, ws_z, ws_c))
 
     threading.Thread(target=calc_thread, daemon=True).start()
@@ -650,11 +740,13 @@ def toggle_obs():
 btn_obs = tk.Button(ext3_frame, text="避障圆球: 开启", command=toggle_obs, width=18)
 btn_obs.pack(side=tk.LEFT, padx=20, pady=10)
 
-# ================= 6. Matplotlib Canvas Setup =================
+# ================== 绘图与动画层 ==================
 fig = plt.Figure(figsize=(14, 7))
 gs = gridspec.GridSpec(3, 2, width_ratios=[1.3, 1])
 
+# 3D 机器人主视窗
 ax_3d = fig.add_subplot(gs[:, 0], projection='3d')
+# 侧边的曲线图 (位移, 速度, 加速度)
 ax_p = fig.add_subplot(gs[0, 1])
 ax_v = fig.add_subplot(gs[1, 1])
 ax_a = fig.add_subplot(gs[2, 1])
@@ -663,6 +755,7 @@ fig.tight_layout(pad=3.0)
 canvas = FigureCanvasTkAgg(fig, master=root)
 canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
+# 曲线对象初始化
 line_tp_z, = ax_p.plot([], [], 'r--', label='目标角度')
 line_ap_z, = ax_p.plot([], [], 'b-', label='实际角度')
 line_tv, = ax_v.plot([], [], 'k--', label='目标角速度')
@@ -670,13 +763,14 @@ line_av, = ax_v.plot([], [], 'b-', label='实际角速度')
 line_ta, = ax_a.plot([], [], 'r--', label='目标角加速度')
 line_aa, = ax_a.plot([], [], 'g-', label='实际角加速度')
 
-ax_p.legend(loc='upper right');
+ax_p.legend(loc='upper right')
 ax_p.set_title("关节1 角度 (deg)")
-ax_v.legend(loc='upper right');
+ax_v.legend(loc='upper right')
 ax_v.set_title("关节1 角速度 (deg/frame)")
-ax_a.legend(loc='upper right');
+ax_a.legend(loc='upper right')
 ax_a.set_title("关节1 角加速度 (deg/frame^2)")
 
+# 3D 对象初始化：基座、动平台、历史轨迹、主动臂、从动臂平行四边形杆等
 base_line, = ax_3d.plot([], [], [], 'k-', linewidth=3)
 end_line, = ax_3d.plot([], [], [], 'g-', linewidth=3)
 history_line, = ax_3d.plot([], [], [], 'orange', linestyle='-', linewidth=2.5)
@@ -691,22 +785,22 @@ box_line, = ax_3d.plot([], [], [], color='#8D6E63', linewidth=3, visible=False)
 workpiece, = ax_3d.plot([], [], [], marker='s', color='gold', markersize=14, markeredgecolor='black', visible=False)
 workspace_scatter = ax_3d.scatter([], [], [], c=[], cmap='viridis', alpha=0.15, visible=False)
 
+# 构建避障球体表面网格
 u, v = np.mgrid[0:2 * np.pi:20j, 0:np.pi:10j]
 obs_mesh = ax_3d.plot_wireframe(obs_center[0] + obs_r * np.cos(u) * np.sin(v),
                                 obs_center[1] + obs_r * np.sin(u) * np.sin(v),
                                 obs_center[2] + obs_r * np.cos(v), color='r', alpha=0.4)
 
-ax_3d.set_xlim([-300, 300]);
-ax_3d.set_ylim([-300, 300]);
+ax_3d.set_xlim([-300, 300])
+ax_3d.set_ylim([-300, 300])
 ax_3d.set_zlim([-600, 0])
 ax_3d.set_title("Delta 机器人", fontsize=14, fontweight='bold')
 status_text_3d = ax_3d.text2D(0.05, 0.98, "状态: 就绪\n动作: 无", transform=ax_3d.transAxes, color='green', fontsize=12,
                               fontweight='bold', verticalalignment='top')
 
 
-# 【核心修改3：修复绘图轴缩放引发的卡死 Bug】
-# 加入数据合法性校验，彻底解决 NaNs 导致 matplotlib 卡死退出的问题
 def safe_ylim(ax, d1, d2, margin=2.0):
+    """动态调整图表的 Y 轴显示范围"""
     arr = np.concatenate([np.atleast_1d(d1), np.atleast_1d(d2)])
     arr = np.array(arr, dtype=float)
     arr = arr[np.isfinite(arr)]
@@ -716,16 +810,23 @@ def safe_ylim(ax, d1, d2, margin=2.0):
     ax.set_ylim(mn - margin, mx + margin)
 
 
-# ================= 7. Animation Loop =================
 def update(frame):
+    """
+    Matplotlib 核心动画回调函数：
+    每帧执行一次。主要负责：推进时间轴、传入 PID 解算最新物理位置、根据逆解重构 3D 几何结构并刷新显示。
+    """
     global current_frame, steady_counter
     if is_paused: return base_line,
 
+    # 推进轨迹进度
     if not is_processing and current_frame < total_frames - 1:
         current_frame += 1
 
     idx = min(current_frame, total_frames - 1)
+    # 取出理论目标点
     t_x, t_y, t_z = traj_x[idx], traj_y[idx], traj_z[idx]
+
+    # 放入物理PID系统解算，得出当帧被延迟/平滑的实际末端位置
     act_pos, act_v, act_a = pid_sys.update([t_x, t_y, t_z])
 
     is_idle = (current_frame >= total_frames - 1) and (np.linalg.norm(pid_sys.vel) < 0.5)
@@ -736,10 +837,11 @@ def update(frame):
         steady_counter = 0
 
     if current_frame == clear_history_frame:
-        draw_h["x"].clear();
-        draw_h["y"].clear();
+        draw_h["x"].clear()
+        draw_h["y"].clear()
         draw_h["z"].clear()
 
+    # 数据记录区（为了画图表而记录）
     if steady_counter < 5:
         ths = robot.inverse_kinematics(act_pos[0], act_pos[1], act_pos[2])
         th1 = np.degrees(ths[0]) if ths else (actual_th_h[-1] if actual_th_h else 0)
@@ -756,21 +858,25 @@ def update(frame):
         actual_pos_h["y"].append(act_pos[1])
         actual_pos_h["z"].append(act_pos[2])
 
+        # 处理落笔机制：将轨迹存入历史轨迹数组中用于长效显示
         if stop_draw_frame == -1 or current_frame < stop_draw_frame:
             if traj_p[idx] == 1:
                 draw_h["x"].append(act_pos[0])
                 draw_h["y"].append(act_pos[1])
                 draw_h["z"].append(act_pos[2])
             else:
+                # 若为抬笔状态，插入 nan 断开 Matplotlib 的折线连接
                 if len(draw_h["x"]) > 0 and not np.isnan(draw_h["x"][-1]):
                     draw_h["x"].append(np.nan)
                     draw_h["y"].append(np.nan)
                     draw_h["z"].append(np.nan)
 
+    # 工业分拣模式下，更新被夹取物块的位置
     if show_env_mode4 and traj_g[idx]:
         workpiece.set_data([act_pos[0]], [act_pos[1]])
         workpiece.set_3d_properties([act_pos[2] - 25])
 
+    # 刷新侧边三张曲线图表的数据
     plot_len = min(200, len(actual_th_h))
     if plot_len > 0:
         disp_tp = target_th_h[-plot_len:]
@@ -779,11 +885,9 @@ def update(frame):
         disp_aa = actual_ddth_h[-plot_len:]
         time_axis = list(range(len(actual_th_h) - plot_len, len(actual_th_h)))
 
-        # 实际角度依然跟着时间轴一点一点画
         line_ap_z.set_data(time_axis, disp_ap)
 
         if len(target_th_profile) > 0:
-            # 统一将目标位置、速度、加速度的【完整数组】一次性画出
             line_tp_z.set_data(range(len(target_th_profile)), target_th_profile)
             line_tv.set_data(range(len(target_dth_profile)), target_dth_profile)
             line_ta.set_data(range(len(target_ddth_profile)), target_ddth_profile)
@@ -804,39 +908,55 @@ def update(frame):
         safe_ylim(ax_v, target_dth_profile if len(target_dth_profile) > 0 else [], disp_av)
         safe_ylim(ax_a, target_ddth_profile if len(target_ddth_profile) > 0 else [], disp_aa)
 
+    # =============== 3D 几何骨架重建核心 ===============
+    # 获取基于物理反馈位姿的实时逆运动学关节角
     thetas = robot.inverse_kinematics(act_pos[0], act_pos[1], act_pos[2])
     if not thetas: return base_line,
 
     base_pts, elbow_pts, end_pts = [], [], []
     for i in range(3):
         a, t = robot.angles[i], thetas[i]
+        # 基座点（静平台边缘）
         bx, by, bz = robot.R * np.cos(a), robot.R * np.sin(a), 0
+        # 肘关节交点（主动臂末端）
         ex, ey, ez = bx + robot.L1 * np.cos(t) * np.cos(a), by + robot.L1 * np.cos(t) * np.sin(
             a), bz - robot.L1 * np.sin(t)
+        # 末端点（动平台边缘点）
         px, py, pz = act_pos[0] + robot.r * np.cos(a), act_pos[1] + robot.r * np.sin(a), act_pos[2]
-        base_pts.append([bx, by, bz]);
-        elbow_pts.append([ex, ey, ez]);
+
+        base_pts.append([bx, by, bz])
+        elbow_pts.append([ex, ey, ez])
         end_pts.append([px, py, pz])
 
     base_pts, elbow_pts, end_pts = np.array(base_pts), np.array(elbow_pts), np.array(end_pts)
+
+    # 绘制连接三角静平台的线段
     base_c = np.vstack((base_pts, base_pts[0]))
     base_line.set_data(base_c[:, 0], base_c[:, 1])
     base_line.set_3d_properties(base_c[:, 2])
+
+    # 绘制连接三角动平台的线段
     end_c = np.vstack((end_pts, end_pts[0]))
     end_line.set_data(end_c[:, 0], end_c[:, 1])
     end_line.set_3d_properties(end_c[:, 2])
 
+    # 更新历史轨迹与目标引导点
     history_line.set_data(draw_h["x"], draw_h["y"])
     history_line.set_3d_properties(draw_h["z"])
     target_point.set_data([t_x], [t_y])
     target_point.set_3d_properties([t_z])
 
+    # 重构并更新三个复合臂组（每个臂组含一个主臂、两个平行四边形副臂）
     for i in range(3):
+        # 1. 主动臂
         arms_main[i].set_data([base_pts[i, 0], elbow_pts[i, 0]], [base_pts[i, 1], elbow_pts[i, 1]])
         arms_main[i].set_3d_properties([base_pts[i, 2], elbow_pts[i, 2]])
+
+        # 2. 从动臂（处理两根平行杆在空间中的横向偏移 W/2）
         offset = (robot.W / 2) * np.array([-np.sin(robot.angles[i]), np.cos(robot.angles[i]), 0])
         e_L, e_R = elbow_pts[i] + offset, elbow_pts[i] - offset
         p_L, p_R = end_pts[i] + offset, end_pts[i] - offset
+
         arms_sub_L[i].set_data([e_L[0], p_L[0]], [e_L[1], p_L[1]])
         arms_sub_L[i].set_3d_properties([e_L[2], p_L[2]])
         arms_sub_R[i].set_data([e_R[0], p_R[0]], [e_R[1], p_R[1]])
@@ -845,5 +965,6 @@ def update(frame):
     return base_line, end_line, history_line, target_point, *arms_main, *arms_sub_L, *arms_sub_R, line_tp_z, line_ap_z, line_tv, line_av, line_ta, line_aa
 
 
+# 绑定动画循环并启动 Tkinter 主消息循环
 ani = FuncAnimation(fig, update, interval=30, blit=False, cache_frame_data=False)
 root.mainloop()
